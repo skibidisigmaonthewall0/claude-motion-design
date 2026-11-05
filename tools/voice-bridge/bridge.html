@@ -1,0 +1,137 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Voice bridge · Nikolay</title>
+<script src="https://js.puter.com/v2/"></script>
+<style>
+  :root { --bg:#08090a; --card:#121417; --line:#23262b; --txt:#e8eaed; --mut:#8a9099; --acc:#d8ff4f; --err:#ff5470; }
+  * { box-sizing:border-box }
+  body { margin:0; background:var(--bg); color:var(--txt); font:15px/1.5 Inter,system-ui,sans-serif }
+  .wrap { max-width:760px; margin:0 auto; padding:32px 20px 60px }
+  h1 { font-size:26px; margin:0 0 4px } .mut { color:var(--mut) }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:14px; padding:18px; margin-top:18px }
+  .row { display:flex; gap:12px; align-items:center; flex-wrap:wrap }
+  button { background:var(--acc); color:#0b0d05; border:0; border-radius:10px; padding:10px 16px; font-weight:700; cursor:pointer; font-size:15px }
+  button.ghost { background:transparent; color:var(--txt); border:1px solid var(--line) }
+  button:disabled { opacity:.45; cursor:default }
+  .dot { width:10px; height:10px; border-radius:50%; background:#555; display:inline-block }
+  .dot.on { background:var(--acc); box-shadow:0 0 10px var(--acc) } .dot.busy { background:#ffb13d; animation:p 1s infinite }
+  @keyframes p { 50% { opacity:.3 } }
+  .job { border-top:1px solid var(--line); padding:12px 0 } .job:first-child { border-top:0 }
+  .job .t { font-size:15px } .job .m { font-size:12px; color:var(--mut); font-family:ui-monospace,monospace }
+  .st { font-size:12px; font-weight:700; padding:2px 8px; border-radius:6px; background:#23262b }
+  .st.done { background:#2a3a10; color:var(--acc) } .st.error { background:#3a1018; color:var(--err) } .st.working { background:#3a2a10; color:#ffb13d }
+  audio { width:100%; margin-top:8px; height:36px }
+  .err { color:var(--err); font-size:13px }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>🎙️ Voice bridge — 🇷🇺 Nikolay</h1>
+  <div class="mut">Агент ставит реплики в очередь, эта вкладка озвучивает их через ваш аккаунт Puter (ElevenLabs) и отправляет аудио обратно в проект. Просто держите вкладку открытой.</div>
+
+  <div class="card">
+    <div class="row">
+      <span id="authDot" class="dot"></span><b id="authTxt">Puter: проверяю…</b>
+      <span style="flex:1"></span>
+      <button id="signIn">Войти в Puter</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="row">
+      <span id="runDot" class="dot"></span><b id="runTxt">Ожидание входа</b>
+      <span style="flex:1"></span>
+      <button id="retry" class="ghost">Повторить ошибки</button>
+      <button id="toggle" class="ghost" disabled>Пауза</button>
+    </div>
+    <div id="lastErr" class="err"></div>
+  </div>
+
+  <div class="card"><div class="row" style="justify-content:space-between"><b>Очередь</b><span id="count" class="mut"></span></div><div id="jobs"></div></div>
+</div>
+<script>
+const $ = (id) => document.getElementById(id);
+let signedIn = false, running = true, busy = false, jobs = [];
+const failedHere = new Set();
+
+function esc(s) { return String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+
+async function checkAuth() {
+  try {
+    signedIn = await puter.auth.isSignedIn();
+    if (signedIn) {
+      const u = await puter.auth.getUser().catch(() => ({}));
+      $('authTxt').textContent = 'Puter: вошли как ' + (u.username || 'пользователь');
+      $('signIn').textContent = 'Сменить аккаунт';
+    } else $('authTxt').textContent = 'Puter: не выполнен вход';
+  } catch (e) { $('authTxt').textContent = 'Puter не загрузился: ' + e; }
+  $('authDot').className = 'dot' + (signedIn ? ' on' : '');
+  $('toggle').disabled = !signedIn;
+}
+
+$('signIn').onclick = async () => {
+  try { if (signedIn) await puter.auth.signOut(); await puter.auth.signIn(); } catch (e) { $('lastErr').textContent = 'Вход: ' + (e.message || e); }
+  checkAuth();
+};
+$('toggle').onclick = () => { running = !running; $('toggle').textContent = running ? 'Пауза' : 'Продолжить'; };
+$('retry').onclick = () => { failedHere.clear(); jobs.filter(j => j.status === 'error').forEach(j => j.status = 'pending'); render(); };
+
+function render() {
+  $('count').textContent = jobs.filter(j => j.status === 'done').length + ' / ' + jobs.length + ' готово';
+  $('jobs').innerHTML = jobs.slice().reverse().map(j => `
+    <div class="job">
+      <div class="row"><span class="st ${j.status}">${j.status}</span><span class="t">«${esc(j.text)}»</span></div>
+      <div class="m">${esc(j.out)} · ${esc(j.model)}</div>
+      ${j.error ? `<div class="err">${esc(j.error)}</div>` : ''}
+      ${j.status === 'done' && j.files ? `<audio controls preload="none" src="api/audio?path=${encodeURIComponent(j.files[0])}&v=${esc(j.done_at||'')}"></audio>` : ''}
+    </div>`).join('') || '<div class="mut">Очередь пуста — агент добавит реплики, когда понадобится голос.</div>';
+  const pending = jobs.filter(j => j.status === 'pending' && !failedHere.has(j.id)).length;
+  $('runDot').className = 'dot' + (busy ? ' busy' : signedIn && running ? ' on' : '');
+  $('runTxt').textContent = !signedIn ? 'Ожидание входа' : busy ? 'Озвучиваю…' : !running ? 'Пауза' : pending ? `В очереди: ${pending}` : 'Готов, жду реплики';
+}
+
+function audioSrc(a) {
+  if (typeof a === 'string') return a;
+  if (a && a.src) return a.src;
+  if (a && a.url) return a.url;
+  throw new Error('пустой ответ от Puter');
+}
+
+async function runJob(j) {
+  busy = true; j.status = 'working'; render();
+  try {
+    const audio = await puter.ai.txt2speech(j.text, { provider: 'elevenlabs', voice: j.voice, model: j.model, output_format: j.format || 'mp3_44100_192' });
+    const blob = await (await fetch(audioSrc(audio))).blob();
+    const r = await fetch('api/upload?id=' + j.id, { method: 'POST', body: blob });
+    if (!r.ok) throw new Error('сервер: ' + (await r.text()));
+    $('lastErr').textContent = '';
+  } catch (e) {
+    const msg = (e && (e.message || e.error?.message)) || JSON.stringify(e);
+    failedHere.add(j.id); $('lastErr').textContent = 'Ошибка: ' + msg;
+    await fetch('api/fail?id=' + j.id, { method: 'POST', body: msg }).catch(() => {});
+  }
+  busy = false;
+}
+
+async function loop() {
+  try {
+    const server = await (await fetch('api/jobs', { cache: 'no-store' })).json();
+    // keep local "pending" overrides from the retry button
+    const local = Object.fromEntries(jobs.map(j => [j.id, j]));
+    jobs = server.map(j => (j.status === 'error' && local[j.id] && local[j.id].status === 'pending' && !failedHere.has(j.id)) ? { ...j, status: 'pending', error: '' } : j);
+    render();
+    if (signedIn && running && !busy) {
+      const next = jobs.find(j => j.status === 'pending' && !failedHere.has(j.id));
+      if (next) await runJob(next);
+    }
+  } catch (e) { $('runTxt').textContent = 'Нет связи с сервером…'; }
+  setTimeout(loop, 1500);
+}
+
+checkAuth().then(loop);
+</script>
+</body>
+</html>
